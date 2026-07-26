@@ -126,6 +126,3 @@ All methods below mutate the accessor's internal DataFrame and return `self`, so
 - pandas
 - numpy
 
-## License
-
-MIT — feel free to use, modify, and share.
