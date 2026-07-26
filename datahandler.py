@@ -7,23 +7,38 @@ import re
 class DataFrameCleaner:
     """
     A lightweight pandas DataFrame cleaner accessor.
+
+    Each method mutates the accessor's internal DataFrame and returns
+    `self`, so calls can be chained directly off `.clean`. Because the
+    chain returns the accessor (not a DataFrame), finish the chain with
+    `.df` to get the actual cleaned DataFrame back.
+
+    `lower()`, `upper()`, and `title()` are alternative capitalization
+    steps — use at most one of them in a given chain.
+
     Usage:
         df = (
             df.clean
               .colnames()
               .dropempty()
               .dropdup()
-              .na(["N/A", "none", "missing"])
+              .na()
               .trim()
               .lower()
               .show()
               .dtnormal()
               .rmcats()
+              .df
         )
     """
 
     def __init__(self, pandas_obj):
         self._df = pandas_obj
+
+    @property
+    def df(self):
+        """Unwrap the accessor and return the underlying DataFrame."""
+        return self._df
 
     # -----------------------------------
     # Clean column names
@@ -32,42 +47,54 @@ class DataFrameCleaner:
         """Convert column names to snake_case."""
         df = self._df.copy()
         df.columns = df.columns.map(str)
-        df.columns = df.columns.str.strip().str.lower().str.replace(r"\W+","_",regex=True).str.replace(r"_+","_",regex=True).str.strip("_")
+        df.columns = (
+            df.columns.str.strip()
+            .str.lower()
+            .str.replace(r"\W+", "_", regex=True)
+            .str.replace(r"_+", "_", regex=True)
+            .str.strip("_")
+        )
         if df.columns.duplicated().any():
+            seen = set()
             new_cols = []
-            counts = {}
             for col in df.columns:
-                counts[col] = counts.get(col, 0) + 1
-                new_name = f"{col}_{counts[col]}" if counts[col] > 1 else col
-                new_cols.append(new_name)
+                name = col
+                i = 1
+                while name in seen:
+                    i += 1
+                    name = f"{col}_{i}"
+                seen.add(name)
+                new_cols.append(name)
             df.columns = new_cols
-        return df
+        self._df = df
+        return self
 
     # -----------------------------------
     # Remove empty rows/columns
     # -----------------------------------
     def dropempty(self):
         """Remove completely empty rows and columns."""
-        df = self._df.dropna(how="all").dropna(axis=1, how="all")
-        return df
+        self._df = self._df.dropna(how="all").dropna(axis=1, how="all")
+        return self
 
     # -----------------------------------
     # Drop duplicate rows
     # -----------------------------------
     def dropdup(self):
         """Drop duplicate rows."""
-        df = self._df.drop_duplicates()
-        return df
+        self._df = self._df.drop_duplicates()
+        return self
 
     # -----------------------------------
-    # Replace certain placeholder strings with NaN
+    # Replace blank strings with NaN
     # -----------------------------------
-    def na(self, patterns=None):
-        """Replace given placeholder strings with NaN."""
-        if patterns is None:
-            patterns = ["n/a" , ""]
-        df = self._df.replace(patterns, np.nan, regex=True)
-        return df
+    def na(self):
+        """Replace blank ('') strings with NaN in string columns."""
+        df = self._df.copy()
+        obj_cols = df.select_dtypes(include=["object", "string"]).columns
+        df[obj_cols] = df[obj_cols].replace("", np.nan, regex=False)
+        self._df = df
+        return self
 
     # -----------------------------------
     # Trim leading/trailing spaces in all string cells
@@ -77,7 +104,8 @@ class DataFrameCleaner:
         df = self._df.copy()
         obj_cols = df.select_dtypes(include=["object", "string"]).columns
         df[obj_cols] = df[obj_cols].apply(lambda s: s.str.strip())
-        return df
+        self._df = df
+        return self
 
     # -----------------------------------
     # Optional: lowercase all string columns
@@ -88,8 +116,9 @@ class DataFrameCleaner:
         obj_cols = df.select_dtypes(include=["object", "string"]).columns
         for col in obj_cols:
             df[col] = df[col].str.lower()
-        return df
-    
+        self._df = df
+        return self
+
     # -----------------------------------
     # Optional: uppercase all string columns
     # -----------------------------------
@@ -99,7 +128,20 @@ class DataFrameCleaner:
         obj_cols = df.select_dtypes(include=["object", "string"]).columns
         for col in obj_cols:
             df[col] = df[col].str.upper()
-        return df
+        self._df = df
+        return self
+
+    # -----------------------------------
+    # Optional: title-case all string columns
+    # -----------------------------------
+    def title(self):
+        """Convert all string columns to title case, e.g. 'john smith' -> 'John Smith'."""
+        df = self._df.copy()
+        obj_cols = df.select_dtypes(include=["object", "string"]).columns
+        for col in obj_cols:
+            df[col] = df[col].str.title()
+        self._df = df
+        return self
 
     # -----------------------------------
     # Chain-friendly print preview
@@ -107,29 +149,29 @@ class DataFrameCleaner:
     def show(self, n=5):
         """Preview the top n rows without breaking the chain."""
         print(self._df.head(n))
-        return self._df
-    
+        return self
 
     def dtnormal(self):
         df = self._df.copy()
-        for col in df.select_dtypes(include=['datetime64[ns]']).columns:
+        for col in df.select_dtypes(include=["datetime64[ns]"]).columns:
             df[col] = df[col].dt.normalize()
-        return df
-    
+        self._df = df
+        return self
 
     def rmcats(self):
         df = self._df.copy()
         for c in df.select_dtypes("category"):
             df[c] = df[c].cat.remove_unused_categories()
-        return df
+        self._df = df
+        return self
 
 
 def profile(df):
     profile_dict = {}
-    
+    total = len(df)
+
     for col in df.columns:
         series = df[col]
-        total = len(series)
         dtype = str(series.dtype)
 
         # --- Core stats ---
@@ -140,25 +182,32 @@ def profile(df):
         missing_count = series.isna().sum()
         missing_percent = round(missing_count / total * 100, 2) if total > 0 else 0.0
         is_unique_ = series.is_unique
-        
-        
 
         # --- Type detection ---
-        numeric = pd.api.types.is_numeric_dtype(series)
-        is_datetime = pd.api.types.is_datetime64_any_dtype(series)
         is_cat_dtype = isinstance(series.dtype, pd.CategoricalDtype)
-        #catlike = is_cat_dtype or pd.api.types.is_object_dtype(series)
+        # A category column with numeric categories (e.g. a numeric-coded
+        # categorical) should still get numeric stats, not fall through to
+        # the generic '---' branch.
+        numeric = pd.api.types.is_numeric_dtype(series) or (
+            is_cat_dtype and pd.api.types.is_numeric_dtype(series.cat.categories)
+        )
+        is_datetime = pd.api.types.is_datetime64_any_dtype(series)
 
         # --- Min / Max / Mean / Sum ---
         if numeric:
-            min_val = series.min()
-            max_val = series.max()
-            mean_val = round(series.mean(), 3) if total - missing_count > 0 else "---"
-            sum_val = series.sum()
+            # Categorical numeric columns need to be unwrapped to their
+            # underlying numeric values before min/max/mean/sum will work.
+            numeric_series = (
+                pd.to_numeric(series.astype(object), errors="coerce") if is_cat_dtype else series
+            )
+            min_val = numeric_series.min()
+            max_val = numeric_series.max()
+            mean_val = round(numeric_series.mean(), 3) if total - missing_count > 0 else "---"
+            sum_val = numeric_series.sum()
             empty_string = "---"
-            zero_count = (series == 0).sum()
-            negative_count = (series < 0).sum()
-            positive_count = (series > 0).sum()
+            zero_count = (numeric_series == 0).sum()
+            negative_count = (numeric_series < 0).sum()
+            positive_count = (numeric_series > 0).sum()
         elif is_datetime:
             non_na = series.dropna()
             min_val = non_na.min().date() if not non_na.empty else "---"
@@ -200,8 +249,6 @@ def profile(df):
             top10_count_lines.append(f"{value} - {count} ({percent}%)")
         top10_by_count = "\n".join(top10_count_lines)
 
-        
-
         # ----------------------------------------
         # Assemble profile
         # ----------------------------------------
@@ -218,25 +265,32 @@ def profile(df):
             "Mean": mean_val,
             "Sum": sum_val,
             "Top 10 Count": top10_by_count,
-         }
+        }
 
     # --- Transpose for readability ---
     profile_df = pd.DataFrame(profile_dict)
     profile_df.index.name = "Rows: " + str(total)
-    profile_df.columns.name = str(int(df.memory_usage(deep=True).sum()/1000)) + " KB"
+    profile_df.columns.name = str(int(df.memory_usage(deep=True).sum() / 1000)) + " KB"
 
     return profile_df
+
 
 def clean(df_):
     df = df_.copy()
     df.columns = df.columns.map(str)
-    
+
     obj_cols = df.select_dtypes(include=["object", "string"]).columns
-    df[obj_cols] = df[obj_cols].replace(["na", "n/a", "none", "missing", ""], np.nan)
-    
-    df.dropna(axis = 0,how="all",inplace = True)
-    df.drop_duplicates(inplace = True)
-    df.columns = df.columns.str.strip().str.lower().str.replace(r"\W+","_",regex=True).str.replace(r"_+","_",regex=True).str.strip("_")
+    placeholders = {"na", "n/a", "none", "missing", ""}
+
+    def _is_placeholder(x):
+        return isinstance(x, str) and x.strip().lower() in placeholders
+
+    placeholder_mask = df[obj_cols].apply(lambda s: s.map(_is_placeholder))
+    df[obj_cols] = df[obj_cols].mask(placeholder_mask, np.nan)
+
+    df.dropna(axis=0, how="all", inplace=True)
+    df.drop_duplicates(inplace=True)
+    df.columns = df.columns.str.strip().str.lower().str.replace(r"\W+", "_", regex=True).str.replace(r"_+", "_", regex=True).str.strip("_")
 
     if df.columns.duplicated().any():
         new_cols = []
@@ -252,7 +306,9 @@ def clean(df_):
 
     return df
 
+
 def rmcats(df):
+    df = df.copy()
     for c in df.select_dtypes("category"):
         df[c] = df[c].cat.remove_unused_categories()
-    return
+    return df
