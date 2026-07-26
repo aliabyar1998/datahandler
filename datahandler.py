@@ -3,6 +3,34 @@ import numpy as np
 import re
 
 
+def _make_hashable(x):
+    """Return a hashable stand-in for x.
+
+    Pandas' duplicate-detection and counting operations (drop_duplicates,
+    nunique, is_unique, value_counts) need to hash every value. Lists,
+    dicts, sets, etc. aren't hashable and would otherwise crash these
+    operations outright. Using each value's repr() as a stand-in lets
+    equal unhashable values still compare as equal (two identical lists
+    produce the same repr), and different values still compare as
+    different, without altering any of the real data in the DataFrame.
+    """
+    try:
+        hash(x)
+        return x
+    except TypeError:
+        return repr(x)
+
+
+def _hashable_series(s):
+    """Return a version of series `s` that is safe to hash (for nunique,
+    is_unique, value_counts), substituting a repr-based proxy for any
+    unhashable values in object-dtype columns. Non-object columns can't
+    contain unhashable values, so they're returned unchanged."""
+    if s.dtype == object:
+        return s.map(_make_hashable)
+    return s
+
+
 @pd.api.extensions.register_dataframe_accessor("clean")
 class DataFrameCleaner:
     """
@@ -46,11 +74,18 @@ class DataFrameCleaner:
     def colnames(self):
         """Convert column names to snake_case."""
         df = self._df.copy()
-        df.columns = df.columns.map(str)
+        # .astype(str) (in addition to .map(str)) matters for an empty
+        # DataFrame: mapping an empty Index never actually calls the
+        # function, so pandas leaves its original dtype (e.g. int64 for
+        # the default RangeIndex) instead of converting it, which would
+        # otherwise crash the .str accessor calls below.
+        df.columns = df.columns.map(str).astype(str).str.strip().str.lower()
+        # A leading '-' (e.g. a column literally named -3) would otherwise
+        # be stripped by the \W+ replacement below, silently turning -3
+        # into "3" and losing the sign. Make it explicit first.
+        df.columns = df.columns.str.replace(r"^-", "neg_", regex=True)
         df.columns = (
-            df.columns.str.strip()
-            .str.lower()
-            .str.replace(r"\W+", "_", regex=True)
+            df.columns.str.replace(r"\W+", "_", regex=True)
             .str.replace(r"_+", "_", regex=True)
             .str.strip("_")
         )
@@ -81,8 +116,15 @@ class DataFrameCleaner:
     # Drop duplicate rows
     # -----------------------------------
     def dropdup(self):
-        """Drop duplicate rows."""
-        self._df = self._df.drop_duplicates()
+        """Drop duplicate rows. Falls back to a hashable proxy comparison
+        if any column contains unhashable values (e.g. lists/dicts), instead
+        of crashing."""
+        df = self._df
+        try:
+            self._df = df.drop_duplicates()
+        except TypeError:
+            proxy = df.apply(lambda col: _hashable_series(col))
+            self._df = df[~proxy.duplicated()]
         return self
 
     # -----------------------------------
@@ -100,10 +142,12 @@ class DataFrameCleaner:
     # Trim leading/trailing spaces in all string cells
     # -----------------------------------
     def trim(self):
-        """Trim whitespace in all string columns."""
+        """Trim whitespace in all string columns. Non-string values (numbers,
+        booleans, lists, dicts, NaN/None) are left untouched, not nulled out."""
         df = self._df.copy()
         obj_cols = df.select_dtypes(include=["object", "string"]).columns
-        df[obj_cols] = df[obj_cols].apply(lambda s: s.str.strip())
+        for col in obj_cols:
+            df[col] = df[col].map(lambda x: x.strip() if isinstance(x, str) else x)
         self._df = df
         return self
 
@@ -111,11 +155,11 @@ class DataFrameCleaner:
     # Optional: lowercase all string columns
     # -----------------------------------
     def lower(self):
-        """Convert all string columns to lowercase."""
+        """Convert all string columns to lowercase. Non-string values are left untouched."""
         df = self._df.copy()
         obj_cols = df.select_dtypes(include=["object", "string"]).columns
         for col in obj_cols:
-            df[col] = df[col].str.lower()
+            df[col] = df[col].map(lambda x: x.lower() if isinstance(x, str) else x)
         self._df = df
         return self
 
@@ -123,11 +167,11 @@ class DataFrameCleaner:
     # Optional: uppercase all string columns
     # -----------------------------------
     def upper(self):
-        """Convert all string columns to uppercase."""
+        """Convert all string columns to uppercase. Non-string values are left untouched."""
         df = self._df.copy()
         obj_cols = df.select_dtypes(include=["object", "string"]).columns
         for col in obj_cols:
-            df[col] = df[col].str.upper()
+            df[col] = df[col].map(lambda x: x.upper() if isinstance(x, str) else x)
         self._df = df
         return self
 
@@ -135,11 +179,12 @@ class DataFrameCleaner:
     # Optional: title-case all string columns
     # -----------------------------------
     def title(self):
-        """Convert all string columns to title case, e.g. 'john smith' -> 'John Smith'."""
+        """Convert all string columns to title case, e.g. 'john smith' -> 'John Smith'.
+        Non-string values are left untouched."""
         df = self._df.copy()
         obj_cols = df.select_dtypes(include=["object", "string"]).columns
         for col in obj_cols:
-            df[col] = df[col].str.title()
+            df[col] = df[col].map(lambda x: x.title() if isinstance(x, str) else x)
         self._df = df
         return self
 
@@ -167,21 +212,24 @@ class DataFrameCleaner:
 
 
 def profile(df):
-    profile_dict = {}
+    records = []
     total = len(df)
 
-    for col in df.columns:
-        series = df[col]
+    for i, col in enumerate(df.columns):
+        # Index positionally (not by label) so that duplicate column names
+        # don't cause df[col] to return a DataFrame instead of a Series.
+        series = df.iloc[:, i]
         dtype = str(series.dtype)
 
         # --- Core stats ---
         value_count_ = series.count()
         value_count_percent = round(value_count_ / total * 100, 2) if total > 0 else 0.0
-        distinct_count = series.nunique(dropna=True)
+        safe_series = _hashable_series(series)
+        distinct_count = safe_series.nunique(dropna=True)
         distinct_percent = round(distinct_count / value_count_ * 100, 2) if value_count_ > 0 else 0.0
         missing_count = series.isna().sum()
         missing_percent = round(missing_count / total * 100, 2) if total > 0 else 0.0
-        is_unique_ = series.is_unique
+        is_unique_ = safe_series.is_unique
 
         # --- Type detection ---
         is_cat_dtype = isinstance(series.dtype, pd.CategoricalDtype)
@@ -235,7 +283,7 @@ def profile(df):
             # convert to date-only series for frequency calculations
             series_for_freq = series.dt.date
         else:
-            series_for_freq = series
+            series_for_freq = safe_series
 
         # ----------------------------------------
         # Top 10 by Count — Value - count (percent%)
@@ -252,7 +300,7 @@ def profile(df):
         # ----------------------------------------
         # Assemble profile
         # ----------------------------------------
-        profile_dict[col] = {
+        records.append({
             "Type": dtype,
             "Uniqueness": is_unique_,
             "Total": f"{value_count_} ({value_count_percent}%)",
@@ -265,10 +313,10 @@ def profile(df):
             "Mean": mean_val,
             "Sum": sum_val,
             "Top 10 Count": top10_by_count,
-        }
+        })
 
-    # --- Transpose for readability ---
-    profile_df = pd.DataFrame(profile_dict)
+    # --- Build the table, keeping every column's stats even if names repeat ---
+    profile_df = pd.DataFrame(records, index=df.columns).T
     profile_df.index.name = "Rows: " + str(total)
     profile_df.columns.name = str(int(df.memory_usage(deep=True).sum() / 1000)) + " KB"
 
@@ -277,32 +325,54 @@ def profile(df):
 
 def clean(df_):
     df = df_.copy()
-    df.columns = df.columns.map(str)
 
-    obj_cols = df.select_dtypes(include=["object", "string"]).columns
-    placeholders = {"na", "n/a", "none", "missing", ""}
+    # 1. Drop completely empty rows and columns before touching column names
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
 
-    def _is_placeholder(x):
-        return isinstance(x, str) and x.strip().lower() in placeholders
-
-    placeholder_mask = df[obj_cols].apply(lambda s: s.map(_is_placeholder))
-    df[obj_cols] = df[obj_cols].mask(placeholder_mask, np.nan)
-
-    df.dropna(axis=0, how="all", inplace=True)
-    df.drop_duplicates(inplace=True)
-    df.columns = df.columns.str.strip().str.lower().str.replace(r"\W+", "_", regex=True).str.replace(r"_+", "_", regex=True).str.strip("_")
+    # Fix up column names: stringify, lowercase, preserve sign on
+    # negative-number names, snake_case, then de-duplicate collisions.
+    # .astype(str) (in addition to .map(str)) matters for an empty
+    # DataFrame: mapping an empty Index never actually calls the function,
+    # so pandas leaves its original dtype (e.g. int64 for the default
+    # RangeIndex) instead of converting it, which would otherwise crash
+    # the .str accessor calls below.
+    df.columns = df.columns.map(str).astype(str).str.strip().str.lower()
+    # A leading '-' (e.g. a column literally named -3) would otherwise be
+    # stripped by the \W+ replacement below, silently turning -3 into "3"
+    # and losing the sign. Make it explicit first.
+    df.columns = df.columns.str.replace(r"^-", "neg_", regex=True)
+    df.columns = df.columns.str.replace(r"\W+", "_", regex=True).str.replace(r"_+", "_", regex=True).str.strip("_")
 
     if df.columns.duplicated().any():
+        seen = set()
         new_cols = []
-        counts = {}
         for col in df.columns:
-            counts[col] = counts.get(col, 0) + 1
-            new_name = f"{col}_{counts[col]}" if counts[col] > 1 else col
-            new_cols.append(new_name)
+            name = col
+            i = 1
+            while name in seen:
+                i += 1
+                name = f"{col}_{i}"
+            seen.add(name)
+            new_cols.append(name)
         df.columns = new_cols
 
-    for col in df.select_dtypes(include=['datetime64[ns]']).columns:
-        df[col] = df[col].dt.normalize()
+    # 4. Trim leading/trailing whitespace on all string columns first, so
+    #    whitespace-only values (e.g. '   ') collapse to '' before the
+    #    blank check below. Non-string values (numbers, booleans, lists,
+    #    dicts, NaN/None) are left untouched, not nulled out.
+    obj_cols = df.select_dtypes(include=["object", "string"]).columns
+    for col in obj_cols:
+        df[col] = df[col].map(lambda x: x.strip() if isinstance(x, str) else x)
+
+    # 2. Only replace blank ('') strings with NaN -- "na", "n/a", "none",
+    #    and "missing" are left untouched as real string values.
+    df[obj_cols] = df[obj_cols].replace("", np.nan, regex=False)
+
+    try:
+        df.drop_duplicates(inplace=True)
+    except TypeError:
+        proxy = df.apply(lambda col: _hashable_series(col))
+        df = df[~proxy.duplicated()]
 
     return df
 
